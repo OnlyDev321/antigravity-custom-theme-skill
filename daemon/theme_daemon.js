@@ -1,0 +1,384 @@
+#!/usr/bin/env node
+'use strict';
+
+/**
+ * Antigravity Custom Theme Daemon (Windows / macOS / Linux)
+ * Connects to Antigravity CDP (DevToolsActivePort), injects dist/theme_payload.js,
+ * persists user theme preferences in theme_config.json, and hot-reloads on rebuild.
+ */
+
+const fs = require('fs');
+const http = require('http');
+const os = require('os');
+const path = require('path');
+
+if (typeof globalThis.WebSocket !== 'function') {
+    console.error('[theme-daemon] Node.js >= 22 with built-in WebSocket is required.');
+    process.exit(1);
+}
+
+const ROOT_DIR = path.resolve(__dirname, '..');
+const PID_FILE = path.join(ROOT_DIR, 'daemon.pid');
+const CONFIG_FILE = process.env.AGY_CONFIG_PATH || path.join(ROOT_DIR, 'theme_config.json');
+const DIST_DIR = path.join(ROOT_DIR, 'dist');
+const PAYLOAD_PATH = path.join(DIST_DIR, 'theme_payload.js');
+const LOG_FILE = path.join(ROOT_DIR, 'daemon.log');
+const DEFAULT_CONFIG = {};
+
+function getAllPortFiles() {
+    if (process.env.AGY_PORT_FILE) {
+        return [process.env.AGY_PORT_FILE];
+    }
+
+    const home = os.homedir();
+    let candidates;
+    if (process.platform === 'win32') {
+        const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
+        candidates = [
+            path.join(appData, 'Antigravity IDE', 'DevToolsActivePort'),
+            path.join(appData, 'antigravity-ide', 'DevToolsActivePort'),
+            path.join(appData, 'Antigravity', 'DevToolsActivePort'),
+            path.join(appData, 'antigravity', 'DevToolsActivePort'),
+        ];
+    } else if (process.platform === 'darwin') {
+        const appSupport = path.join(home, 'Library', 'Application Support');
+        candidates = [
+            path.join(appSupport, 'Antigravity IDE', 'DevToolsActivePort'),
+            path.join(appSupport, 'antigravity-ide', 'DevToolsActivePort'),
+            path.join(appSupport, 'Antigravity', 'DevToolsActivePort'),
+            path.join(appSupport, 'antigravity', 'DevToolsActivePort'),
+        ];
+    } else {
+        const xdgConfig = process.env.XDG_CONFIG_HOME || path.join(home, '.config');
+        candidates = [
+            path.join(xdgConfig, 'Antigravity IDE', 'DevToolsActivePort'),
+            path.join(xdgConfig, 'antigravity-ide', 'DevToolsActivePort'),
+            path.join(xdgConfig, 'Antigravity', 'DevToolsActivePort'),
+            path.join(xdgConfig, 'antigravity', 'DevToolsActivePort'),
+        ];
+    }
+
+    return candidates.filter((p) => {
+        try {
+            return fs.existsSync(p);
+        } catch (_) {
+            return false;
+        }
+    });
+}
+
+function resolvePortFile() {
+    const files = getAllPortFiles();
+    return files.length > 0 ? files[0] : '';
+}
+
+function log(msg) {
+    const line = `[${new Date().toISOString()}] ${msg}\n`;
+    try {
+        if (fs.existsSync(LOG_FILE) && fs.statSync(LOG_FILE).size > 512 * 1024) {
+            fs.writeFileSync(LOG_FILE, '');
+        }
+        fs.appendFileSync(LOG_FILE, line);
+    } catch (_) {}
+    if (process.stdout.isTTY || process.env.AGY_DAEMON_STDOUT === '1') {
+        process.stdout.write(line);
+    }
+}
+
+function isPidAlive(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+function acquirePidLock() {
+    if (fs.existsSync(PID_FILE)) {
+        const existingPid = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim(), 10);
+        if (existingPid && existingPid !== process.pid && isPidAlive(existingPid)) {
+            log(`Another daemon instance is already running (PID ${existingPid}). Exiting.`);
+            process.exit(0);
+        }
+    }
+    fs.writeFileSync(PID_FILE, String(process.pid), 'utf8');
+}
+
+function removePidLock() {
+    try {
+        if (fs.existsSync(PID_FILE)) {
+            const pid = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim(), 10);
+            if (pid === process.pid) {
+                fs.unlinkSync(PID_FILE);
+            }
+        }
+    } catch (_) {}
+}
+
+function readConfig() {
+    try {
+        if (fs.existsSync(CONFIG_FILE)) {
+            const parsed = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+            if (parsed && typeof parsed === 'object') {
+                return { ...DEFAULT_CONFIG, ...parsed };
+            }
+        }
+    } catch (err) {
+        log(`Failed reading theme_config.json: ${err.message}`);
+    }
+    return { ...DEFAULT_CONFIG };
+}
+
+function saveConfig(next) {
+    try {
+        const merged = { ...readConfig(), ...next };
+        fs.writeFileSync(CONFIG_FILE, JSON.stringify(merged, null, 2), 'utf8');
+        return merged;
+    } catch (err) {
+        log(`Failed saving theme_config.json: ${err.message}`);
+        return null;
+    }
+}
+
+let missingPayloadLogged = false;
+function buildInjectedSource() {
+    if (!fs.existsSync(PAYLOAD_PATH)) {
+        if (!missingPayloadLogged) {
+            log(`Payload not built yet (${PAYLOAD_PATH}). Run: python scripts/build_payload.py`);
+            missingPayloadLogged = true;
+        }
+        return null;
+    }
+    missingPayloadLogged = false;
+
+    const cfgJson = JSON.stringify(readConfig());
+    const payloadCode = fs.readFileSync(PAYLOAD_PATH, 'utf8');
+    return `window.__AGY_INITIAL_CONFIG__ = ${cfgJson};\n${payloadCode}`;
+}
+
+function readPortInfo(portFile) {
+    try {
+        if (!portFile || !fs.existsSync(portFile)) return null;
+        const lines = fs
+            .readFileSync(portFile, 'utf8')
+            .trim()
+            .split(/\r?\n/)
+            .map((s) => s.trim())
+            .filter(Boolean);
+        const port = parseInt(lines[0], 10);
+        if (!Number.isFinite(port) || port <= 0) return null;
+        return { port, token: lines[1] || '', portFile };
+    } catch (_) {
+        return null;
+    }
+}
+
+function getPortInfo() {
+    const portFile = resolvePortFile();
+    return readPortInfo(portFile);
+}
+
+function fetchJson(url) {
+    return new Promise((resolve, reject) => {
+        const req = http.get(url, { timeout: 2000 }, (res) => {
+            let body = '';
+            res.on('data', (chunk) => {
+                body += chunk;
+            });
+            res.on('end', () => {
+                try {
+                    resolve(JSON.parse(body));
+                } catch (err) {
+                    reject(err);
+                }
+            });
+        });
+        req.on('timeout', () => req.destroy(new Error('HTTP timeout')));
+        req.on('error', reject);
+    });
+}
+
+const sessions = new Map();
+let lastPort = null;
+let reloadTimer = null;
+
+function createSession(target) {
+    const ws = new globalThis.WebSocket(target.webSocketDebuggerUrl);
+    let nextId = 1;
+    const pending = new Map();
+    const session = { id: target.id, ws, target };
+    sessions.set(target.id, session);
+
+    function send(method, params = {}) {
+        return new Promise((resolve, reject) => {
+            if (ws.readyState !== 1) {
+                reject(new Error('WebSocket is not open'));
+                return;
+            }
+            const id = nextId++;
+            pending.set(id, { resolve, reject });
+            ws.send(JSON.stringify({ id, method, params }));
+        });
+    }
+
+    session.reinject = async () => {
+        const src = buildInjectedSource();
+        if (!src) return;
+        try {
+            await send('Runtime.evaluate', { expression: src, awaitPromise: false });
+        } catch (_) {}
+    };
+
+    ws.addEventListener('message', async (event) => {
+        let msg;
+        try {
+            msg = JSON.parse(String(event.data));
+        } catch (_) {
+            return;
+        }
+
+        if (msg.id && pending.has(msg.id)) {
+            const p = pending.get(msg.id);
+            pending.delete(msg.id);
+            if (msg.error) p.reject(new Error(msg.error.message || 'CDP error'));
+            else p.resolve(msg.result);
+            return;
+        }
+
+        if (msg.method === 'Runtime.bindingCalled' && msg.params && msg.params.name === 'agySaveThemeConfig') {
+            try {
+                const payload = JSON.parse(msg.params.payload || '{}');
+                saveConfig(payload);
+                for (const other of sessions.values()) {
+                    if (other.id !== target.id) {
+                        other.reinject();
+                    }
+                }
+            } catch (err) {
+                log(`Config binding error: ${err.message}`);
+            }
+            return;
+        }
+
+        if (msg.method === 'Page.frameNavigated' && msg.params && msg.params.frame && !msg.params.frame.parentId) {
+            await session.reinject();
+        }
+    });
+
+    ws.addEventListener('open', async () => {
+        try {
+            await send('Page.enable');
+            await send('Runtime.enable');
+            try {
+                await send('Runtime.addBinding', { name: 'agySaveThemeConfig' });
+            } catch (_) {}
+
+            const src = buildInjectedSource();
+            if (src) {
+                await send('Page.addScriptToEvaluateOnNewDocument', { source: src });
+                await send('Runtime.evaluate', { expression: src, awaitPromise: false });
+            }
+            log(`Attached target ${target.id} (${target.url})`);
+        } catch (err) {
+            log(`Attach error for ${target.id}: ${err.message}`);
+        }
+    });
+
+    const cleanup = () => {
+        for (const p of pending.values()) {
+            p.reject(new Error('WebSocket closed'));
+        }
+        pending.clear();
+        sessions.delete(target.id);
+    };
+    ws.addEventListener('close', cleanup);
+    ws.addEventListener('error', cleanup);
+}
+
+async function scanPages() {
+    const portFiles = getAllPortFiles();
+    if (portFiles.length === 0) return;
+
+    const seenPorts = new Set();
+    const allPages = [];
+    for (const portFile of portFiles) {
+        const info = readPortInfo(portFile);
+        if (!info || seenPorts.has(info.port)) continue;
+        seenPorts.add(info.port);
+
+        let targets;
+        try {
+            targets = await fetchJson(`http://127.0.0.1:${info.port}/json`);
+        } catch (_) {
+            continue;
+        }
+        if (!Array.isArray(targets)) continue;
+
+        const pages = targets.filter((t) => {
+            if (!t || t.type !== 'page' || !t.webSocketDebuggerUrl) return false;
+            const url = String(t.url || '');
+            if (url.startsWith('devtools://') || url.startsWith('chrome-extension://')) return false;
+            return url.includes('127.0.0.1') || url.includes('workbench') || url.includes('launchpad');
+        });
+        allPages.push(...pages);
+    }
+
+    const liveIds = new Set(allPages.map((p) => p.id));
+    for (const [id, session] of sessions.entries()) {
+        if (!liveIds.has(id)) {
+            try {
+                session.ws.close();
+            } catch (_) {}
+            sessions.delete(id);
+        }
+    }
+
+    for (const page of allPages) {
+        if (!sessions.has(page.id)) {
+            createSession(page);
+        }
+    }
+}
+
+function watchPayload() {
+    try {
+        if (!fs.existsSync(DIST_DIR)) {
+            fs.mkdirSync(DIST_DIR, { recursive: true });
+        }
+        fs.watch(DIST_DIR, (_eventType, filename) => {
+            if (filename && filename !== 'theme_payload.js') return;
+            clearTimeout(reloadTimer);
+            reloadTimer = setTimeout(() => {
+                log('Detected dist/theme_payload.js update; hot-reloading attached pages.');
+                for (const s of sessions.values()) {
+                    s.reinject();
+                }
+            }, 250);
+        });
+    } catch (err) {
+        log(`fs.watch skipped: ${err.message}`);
+    }
+}
+
+function shutdown(signal) {
+    log(`Shutting down on ${signal}.`);
+    for (const s of sessions.values()) {
+        try {
+            s.ws.close();
+        } catch (_) {}
+    }
+    sessions.clear();
+    removePidLock();
+    process.exit(0);
+}
+
+acquirePidLock();
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('exit', removePidLock);
+
+log(`Theme daemon started (PID ${process.pid}, platform=${process.platform}, portFile=${resolvePortFile()}).`);
+watchPayload();
+scanPages();
+setInterval(scanPages, 1500);
